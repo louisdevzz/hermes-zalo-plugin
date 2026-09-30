@@ -11,7 +11,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 // module through the resolved ESM entry (subpath imports are blocked by the map).
 const _zcaUtils = await import(pathToFileURL(path.join(path.dirname(fileURLToPath(import.meta.resolve("zca-js"))), "utils.js")).href);
 const { encodeAES, makeURL, request, resolveResponse } = _zcaUtils;
-import { markdownToZalo } from "./markdownToZalo.js";
+import { markdownToZalo, stripMarkdown } from "./markdownToZalo.js";
 
 const DEFAULT_UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0";
@@ -895,23 +895,64 @@ export class ZaloClient extends EventEmitter {
 
   async sendText(threadId, threadType, text, mentions, quote, styles) {
     const msgText = String(text);
-    let content;
+    const targetType = this._threadTypeEnum(threadType);
 
+    // If message exceeds 1900 chars, chunk it to avoid Zalo 2000-char limits
+    if (msgText.length > 1900) {
+      const chunks = [];
+      let rem = msgText;
+      while (rem.length > 0) {
+        if (rem.length <= 1900) {
+          chunks.push(rem);
+          break;
+        }
+        let idx = rem.lastIndexOf("\n", 1900);
+        if (idx < 500) idx = rem.lastIndexOf(" ", 1900);
+        if (idx < 500) idx = 1900;
+        chunks.push(rem.slice(0, idx));
+        rem = rem.slice(idx).trimStart();
+      }
+      let lastRes = null;
+      for (const chunk of chunks) {
+        if (!chunk.trim()) continue;
+        lastRes = await this.sendText(threadId, threadType, chunk, mentions, quote, styles);
+        await new Promise((r) => setTimeout(r, 250));
+      }
+      return lastRes;
+    }
+
+    let content;
     if (styles && Array.isArray(styles) && styles.length > 0) {
-      // Explicit styles provided — trust the caller
       content = { msg: msgText, styles };
+    } else if (styles === false) {
+      content = { msg: stripMarkdown(msgText) };
     } else {
-      // Auto-convert markdown syntax → Zalo styles
       const converted = markdownToZalo(msgText);
       content = { msg: converted.text };
-      if (converted.styles.length > 0) {
-        content.styles = converted.styles;
+      const validStyles = (converted.styles || []).filter(
+        (s) => s.start < 1950 && s.start + s.len <= 2000
+      );
+      if (validStyles.length > 0) {
+        content.styles = validStyles;
       }
     }
 
     if (Array.isArray(mentions) && mentions.length) content.mentions = mentions;
     if (quote) content.quote = quote;
-    return await this.api.sendMessage(content, String(threadId), this._threadTypeEnum(threadType));
+
+    try {
+      return await this.api.sendMessage(content, String(threadId), targetType);
+    } catch (err) {
+      // Fall back to plain text if rich formatting failed
+      if (content.styles && content.styles.length > 0) {
+        console.warn(`[zalo] Send with styles failed (${err?.message || err}), falling back to plain text`);
+        const plainContent = { msg: content.msg };
+        if (content.mentions) plainContent.mentions = content.mentions;
+        if (content.quote) plainContent.quote = content.quote;
+        return await this.api.sendMessage(plainContent, String(threadId), targetType);
+      }
+      throw err;
+    }
   }
 
   // ── Reactions ──────────────────────────────────────────────────────────

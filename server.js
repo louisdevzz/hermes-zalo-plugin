@@ -319,7 +319,9 @@ app.post("/send", async (req, res) => {
     const r = await client.sendText(threadId, threadType, text, mentions, quote, styles);
     res.json({ success: true, result: r });
   } catch (e) {
-    res.status(500).json({ error: String(e && e.message ? e.message : e) });
+    const errStr = String(e && e.message ? e.message : e);
+    console.error(`[bridge] /send error (threadId=${threadId}, type=${threadType}): ${errStr}`);
+    res.status(500).json({ error: errStr });
   }
 });
 

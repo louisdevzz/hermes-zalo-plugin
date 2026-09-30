@@ -197,7 +197,9 @@ function markdownToZalo(md) {
   for (const sp of spans) {
     const mapped = mapRangeToClean(sp.contentStart, sp.contentEnd, originalToClean);
     if (mapped && mapped.len > 0) {
-      styleEntries.push({ start: mapped.start, len: mapped.len, st: sp.style });
+      if (mapped.start < 1950 && (mapped.start + mapped.len) <= 2000) {
+        styleEntries.push({ start: mapped.start, len: mapped.len, st: sp.style });
+      }
     }
   }
 

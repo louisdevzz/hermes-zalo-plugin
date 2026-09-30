@@ -292,7 +292,7 @@ class ZaloAdapter(BasePlatformAdapter):
         self.log_ids = _truthy(os.getenv("ZALO_LOG_IDS")) if os.getenv("ZALO_LOG_IDS") else bool(extra.get("log_ids", False))
 
         max_msg = extra.get("max_message_length")
-        self.max_message_length = int(max_msg or 4000)
+        self.max_message_length = int(max_msg or 1900)
 
         self._own_id: Optional[str] = None
         self._own_name: Optional[str] = os.getenv("ZALO_BOT_NAME") or None
@@ -845,10 +845,10 @@ class ZaloAdapter(BasePlatformAdapter):
         for chunk in chunks:
             if not chunk.strip():
                 continue
-            res = await self._post(
-                "/send",
-                {"threadId": chat_id, "threadType": thread_type, "text": chunk},
-            )
+            payload = {"threadId": chat_id, "threadType": thread_type, "text": chunk}
+            if metadata and metadata.get("plain_fallback"):
+                payload["styles"] = False
+            res = await self._post("/send", payload)
             if res.get("error"):
                 return SendResult(success=False, error=res["error"])
             last = res
@@ -864,6 +864,23 @@ class ZaloAdapter(BasePlatformAdapter):
                 elif result.get("msgId") is not None:
                     msg_id = str(result.get("msgId"))
         return SendResult(success=True, message_id=msg_id)
+    async def _send_plain_fallback(
+        self,
+        chat_id: str,
+        content: str,
+        *,
+        reply_to: Optional[str] = None,
+        metadata: Any = None,
+    ) -> SendResult:
+        meta = dict(metadata or {})
+        meta["plain_fallback"] = True
+        return await self.send(
+            chat_id=chat_id,
+            content=content[:1900],
+            reply_to=reply_to,
+            metadata=meta,
+        )
+
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         thread_type = self._thread_type_from_chat_id(chat_id, metadata)
@@ -1515,7 +1532,7 @@ def register(ctx):
         cron_deliver_env_var="ZALO_HOME_CHANNEL",
         allowed_users_env="ZALO_ALLOWED_USERS",
         allow_all_env="ZALO_ALLOW_ALL_USERS",
-        max_message_length=4000,
+        max_message_length=1900,
         emoji="",
         pii_safe=False,
         allow_update_command=True,
@@ -1524,6 +1541,6 @@ def register(ctx):
             "not render markdown — use plain text only. The user likely writes "
             "in Vietnamese; reply in Vietnamese unless they switch. Keep replies "
             "concise and conversational. You can send images, files, stickers, "
-            "and voice. Messages over ~4000 chars are auto-split."
+            "and voice. Messages over ~1900 chars are auto-split."
         ),
     )
