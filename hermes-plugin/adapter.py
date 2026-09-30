@@ -279,7 +279,7 @@ class ZaloAdapter(BasePlatformAdapter):
         self.max_message_length = int(max_msg or 4000)
 
         self._own_id: Optional[str] = None
-        self._own_name: Optional[str] = None
+        self._own_name: Optional[str] = os.getenv("ZALO_BOT_NAME") or None
         # Remember the thread type per chat_id from inbound messages so replies
         # route correctly (user vs group). Zalo thread IDs don't encode type.
         self._thread_types: Dict[str, str] = {}
@@ -302,7 +302,7 @@ class ZaloAdapter(BasePlatformAdapter):
 
     # ── Connection lifecycle ──────────────────────────────────────────────
 
-    async def connect(self) -> bool:
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
         if not self.bridge_url:
             self._set_fatal_error("config_missing", "ZALO_PLUGIN_URL must be set", retryable=False)
             return False
@@ -651,7 +651,8 @@ class ZaloAdapter(BasePlatformAdapter):
         # 1) Real mention by uid.
         mentions = m.get("mentions") or []
         if self._own_id and str(self._own_id) in {str(x) for x in mentions}:
-            return self._strip_leading_name(text) or text
+            stripped = self._strip_leading_name(text)
+            return stripped if stripped is not None else (text or " ")
 
         # 2) Reply to one of the bot's messages.
         if self._own_id and str(m.get("quotedOwnerId") or "") == str(self._own_id):
