@@ -23,7 +23,8 @@ Configuration in config.yaml::
 
 Or via environment variables (override config.yaml):
     ZALO_PLUGIN_URL, ZALO_PLUGIN_TOKEN, ZALO_ALLOWED_USERS,
-    ZALO_ALLOW_ALL_USERS, ZALO_HOME_CHANNEL, ZALO_GROUP_REQUIRE_MENTION
+    ZALO_ALLOW_ALL_USERS, ZALO_HOME_CHANNEL, ZALO_GROUP_REQUIRE_MENTION,
+    ZALO_GROUP_CONTEXT, ZALO_GROUP_CONTEXT_LIMIT
 """
 
 import asyncio
@@ -32,6 +33,7 @@ import logging
 import os
 from datetime import datetime
 from typing import Any, Dict, List, Optional
+from collections import OrderedDict
 
 logger = logging.getLogger(__name__)
 
@@ -263,6 +265,20 @@ class ZaloAdapter(BasePlatformAdapter):
         if mode not in {"mention", "all", "off"}:
             mode = "mention"
         self.group_mode = mode
+
+        # Group context: when the bot is triggered in a group, inject the recent
+        # group history (incl. media others shared, with downloadable URLs) so the
+        # agent understands the conversation and can act on shared files/videos.
+        self.group_context = _truthy(os.getenv("ZALO_GROUP_CONTEXT")) if os.getenv("ZALO_GROUP_CONTEXT") else bool(extra.get("group_context", True))
+        gc_raw = os.getenv("ZALO_GROUP_CONTEXT_LIMIT") or extra.get("group_context_limit")
+        try:
+            self.group_context_limit = max(1, min(100, int(gc_raw)))
+        except (TypeError, ValueError):
+            self.group_context_limit = 20
+        # Live per-thread buffer of inbound group messages (from the WS feed —
+        # Zalo's REST group-history endpoint returns 404 as of 2026-09):
+        # thread_id -> list of normalized entries, oldest first. Bounded.
+        self._recent: "OrderedDict[str, List[Dict[str, Any]]]" = OrderedDict()
 
         # Deprecated flag: warn but honor (allow_all_users=true had no real effect
         # beyond the old confusing gate; empty allowlist already means "all").
@@ -554,6 +570,12 @@ class ZaloAdapter(BasePlatformAdapter):
             logger.debug("Zalo: ignoring message in non-allowed thread %s", thread_id)
             return
 
+        # Live group-context buffer — before the sender gate so messages from
+        # other group members are also collected (their files are exactly what
+        # the agent may need to fetch and act on).
+        if chat_type == "group":
+            self._buffer_group_message(thread_id, m)
+
         # A) Sender allowlist — empty = everyone.
         if self._allowed_users and sender_id not in self._allowed_users:
             logger.debug("Zalo: ignoring message from non-allowed user %s", sender_id)
@@ -569,6 +591,16 @@ class ZaloAdapter(BasePlatformAdapter):
                     return
                 text = addressed
             # group_mode == "all" → respond to everything (subject to A+B above)
+
+        # Group context: show the agent what other members said/shared recently
+        # (e.g. a video someone posted) so "@bot xem file đó" works in groups.
+        if chat_type == "group":
+            try:
+                context = await self._fetch_group_context(thread_id, str(m.get("messageId") or ""))
+                if context:
+                    text = context + (text or "")
+            except Exception as e:
+                logger.warning("Zalo: group context fetch failed: %s", e)
 
         source = self.build_source(
             chat_id=thread_id,
@@ -679,6 +711,91 @@ class ZaloAdapter(BasePlatformAdapter):
             if low.startswith("@" + cl):
                 return t[len(c) + 1:].lstrip(" :,@").strip() or t
         return None
+
+    # ── Group context (recent messages in the group) ─────────────────────
+
+    def _format_group_context(self, messages: List[Dict[str, Any]], exclude_msg_id: str) -> str:
+        """Render recent group messages as a compact transcript block.
+
+        Media (image/video/file/voice) carries its URL so the agent can
+        download it directly (a plain GET works — same as the bridge).
+        """
+        lines: List[str] = []
+        for m in messages:
+            if str(m.get("messageId") or "") == str(exclude_msg_id or ""):
+                continue
+            try:
+                when = datetime.fromtimestamp(int(m.get("ts") or 0) / 1000).strftime("%H:%M")
+            except (ValueError, TypeError, OSError, OverflowError):
+                when = ""
+            who = m.get("senderName") or m.get("senderId") or "?"
+            text = " ".join(str(m.get("text") or "").split())
+            if len(text) > 300:
+                text = text[:300] + "…"
+            media = m.get("media") if isinstance(m.get("media"), dict) else None
+            if not text and not (media and media.get("url")):
+                continue
+            base = f"- {when} {who}:" + (f" {text}" if text else " (gửi tin nhắn khác)")
+            if media and media.get("url"):
+                fname = media.get("fileName") or "media"
+                base += f"\n  ↳ [{media.get('kind') or 'file'}] {fname} — {media.get('url')}"
+            lines.append(base)
+        if not lines:
+            return ""
+        return (
+            "[Group context — recent messages in this group, oldest first. "
+            "Media URLs are downloadable with a plain GET/curl. Use this to "
+            "understand the conversation and act on files/media others shared.]\n"
+            + "\n".join(lines)
+            + "\n[/Group context]\n\n"
+        )
+
+    _RECENT_MAX_THREADS = 200
+
+    def _buffer_group_message(self, thread_id: str, m: Dict[str, Any]) -> None:
+        """Keep a rolling per-thread window of inbound group messages (the live
+        WS feed) so group context works without Zalo's history API (which
+        404s as of 2026-09). Bounded to keep memory small."""
+        if not self.group_context:
+            return
+        entry = {
+            "messageId": str(m.get("messageId") or ""),
+            "ts": m.get("ts"),
+            "senderId": m.get("senderId"),
+            "senderName": m.get("senderName"),
+            "text": m.get("text"),
+            "media": m.get("media") if isinstance(m.get("media"), dict) else None,
+        }
+        buf = self._recent
+        lst = buf.get(thread_id)
+        if lst is None:
+            lst = buf[thread_id] = []
+            while len(buf) > self._RECENT_MAX_THREADS:
+                buf.popitem(last=False)  # evict the oldest thread
+        lst.append(entry)
+        cap = max(self.group_context_limit, 20)
+        if len(lst) > cap:
+            del lst[: len(lst) - cap]
+        buf.move_to_end(thread_id)
+
+    async def _fetch_group_context(self, thread_id: str, exclude_msg_id: str = "") -> str:
+        """Recent group context from the live WS buffer; if the buffer is thin
+        (e.g. right after a restart) fall back to the REST /history endpoint.
+        Returns "" when the feature is off, nothing is available, or both fail."""
+        if not self.group_context or not thread_id:
+            return ""
+        try:
+            messages = list(self._recent.get(thread_id) or [])
+            if len(messages) < 2:
+                data = await self._get("/history", {"threadId": thread_id, "limit": self.group_context_limit})
+                if isinstance(data, dict) and isinstance(data.get("messages"), list):
+                    messages = data["messages"]
+            if not messages:
+                return ""
+            return self._format_group_context(messages, exclude_msg_id)
+        except Exception as e:
+            logger.warning("Zalo: group context failed: %s", e)
+            return ""
 
     # ── Outbound ──────────────────────────────────────────────────────────
 

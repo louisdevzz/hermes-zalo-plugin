@@ -37,6 +37,14 @@ optional_env:
     description: "In groups, when the bot responds: 'mention' (only when @mentioned or replied-to, default), 'all' (every message in allowed groups), or 'off' (DM only)."
     prompt: "Group mode (mention/all/off)"
     password: false
+  - name: ZALO_GROUP_CONTEXT
+    description: "When the bot is triggered in a group, inject the recent group messages (including media others shared, with downloadable URLs) as context, so it understands the conversation and can act on shared files/videos. Default true. Set false to disable."
+    prompt: "Group context on? (true/false)"
+    password: false
+  - name: ZALO_GROUP_CONTEXT_LIMIT
+    description: "How many recent group messages to include as context (1-100). Default 20."
+    prompt: "Group context message limit (default 20)"
+    password: false
   - name: ZALO_LOG_IDS
     description: "Log sender uid + threadId of every inbound message so you can discover IDs to add to allowlists. Default false."
     prompt: "Log inbound IDs? (true/false)"

@@ -123,6 +123,7 @@ const ROUTE_ACTION = {
   "GET /find-user": "findUser",
   "GET /groups": "getAllGroups",
   "GET /chat-info": "getUserInfo",
+  "GET /history": "getGroupChatHistory",
   "GET /stickers": "getStickers",
   "POST /group/create": "createGroup",
   "POST /group/add": "addUserToGroup",
@@ -403,6 +404,29 @@ app.get("/chat-info", async (req, res) => {
       const info = await client.getUserInfo(threadId);
       res.json({ threadId, type: "user", info });
     }
+  } catch (e) {
+    res.status(500).json({ error: String(e && e.message ? e.message : e) });
+  }
+});
+
+// Recent group history. GET /history?threadId=<groupId>&limit=N (default 20, max 100).
+// Each message is normalized to the SAME shape as inbound SSE events
+// (text + media {url, kind, fileName, ext, mime}), so Hermes can reference
+// what other members said and shared — media URLs are plain-GET downloadable.
+app.get("/history", async (req, res) => {
+  if (!checkAuth(req, res)) return;
+  if (!requireLogin(res)) return;
+  if (!guardAction("getGroupChatHistory", res)) return;
+  const threadId = String(req.query.threadId || "");
+  const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 20));
+  if (!threadId) return res.status(400).json({ error: "threadId required" });
+  try {
+    const out = await client.getGroupHistory(threadId, limit);
+    const messages = (out && Array.isArray(out.groupMsgs) ? out.groupMsgs : [])
+      .map((msg) => client._normaliseMessage(msg, { includeSelf: true }))
+      .filter((m) => m && (m.text || (m.media && m.media.url)))
+      .sort((a, b) => Number(a.ts) - Number(b.ts));
+    res.json({ threadId, limit, count: messages.length, messages });
   } catch (e) {
     res.status(500).json({ error: String(e && e.message ? e.message : e) });
   }

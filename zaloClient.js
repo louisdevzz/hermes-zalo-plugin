@@ -5,7 +5,12 @@
 import fs from "node:fs";
 import path from "node:path";
 import { EventEmitter } from "node:events";
-import { Zalo, ThreadType, LoginQRCallbackEventType, Reactions } from "zca-js";
+import { Zalo, ThreadType, LoginQRCallbackEventType, Reactions, GroupMessage } from "zca-js";
+import { fileURLToPath, pathToFileURL } from "node:url";
+// zca-js's package.json "exports" only exposes ".", so load its internal utils
+// module through the resolved ESM entry (subpath imports are blocked by the map).
+const _zcaUtils = await import(pathToFileURL(path.join(path.dirname(fileURLToPath(import.meta.resolve("zca-js"))), "utils.js")).href);
+const { encodeAES, makeURL, request, resolveResponse } = _zcaUtils;
 import { markdownToZalo } from "./markdownToZalo.js";
 
 const DEFAULT_UA =
@@ -761,11 +766,11 @@ export class ZaloClient extends EventEmitter {
    * Convert a zca-js Message into a flat inbound event for Hermes.
    * Skips our own messages unless selfListen is on.
    */
-  _normaliseMessage(message) {
+  _normaliseMessage(message, { includeSelf = false } = {}) {
     const isGroup = message.type === ThreadType.Group;
     const data = message.data || {};
 
-    if (message.isSelf && !this.selfListen) return null;
+    if (message.isSelf && !this.selfListen && !includeSelf) return null;
 
     const msgType = data.msgType || "";
     let text = "";
@@ -1138,6 +1143,48 @@ export class ZaloClient extends EventEmitter {
       return a;
     });
     return await fn.apply(this.api, mapped);
+  }
+
+  // ── Group chat history (for Hermes context) ─────────────────────────────
+  // Standard zca-js call first; if the primary service host rejects the
+  // endpoint, retry across the other mapped "group" service hosts (Zalo
+  // load-balances these endpoints and some hosts 404 on this path).
+  async getGroupHistory(groupId, count = 20) {
+    if (!this.api) throw new Error("not logged in");
+    try {
+      return await this.api.getGroupChatHistory(String(groupId), count);
+    } catch (e0) {
+      // The "group" service host can 404 on this endpoint while another mapped
+      // host serves it (Zalo migrates endpoints between hosts). Retry the
+      // standard path once per chat-ish service host before giving up.
+      const ctx = this.api.listener && this.api.listener.ctx;
+      const map = this.api.zpwServiceMap || {};
+      const candidates = [];
+      for (const key of ["group", "chat", "zimsg", "conversation", "group_cloud_message"]) {
+        for (const h of map[key] || []) if (!candidates.includes(h)) candidates.push(h);
+      }
+      if (!ctx || !candidates.length) throw e0;
+      let lastErr = e0;
+      for (const host of candidates) {
+        try {
+          const enc = encodeAES(ctx.secretKey, JSON.stringify({ grid: String(groupId), count }));
+          const url = makeURL(ctx, `${host}/api/group/history`, { params: enc }, true);
+          const res = await request(ctx, url, { method: "GET" });
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          const data = await resolveResponse(ctx, res, undefined);
+          const raw = typeof data === "string" ? JSON.parse(data) : data;
+          return {
+            lastActionId: raw.lastActionId || "",
+            lastActionIdOther: raw.lastActionIdOther || "",
+            more: raw.more || 0,
+            groupMsgs: (raw.groupMsgs || []).map((m) => new GroupMessage(ctx.uid, m)),
+          };
+        } catch (e) {
+          lastErr = e;
+        }
+      }
+      throw lastErr;
+    }
   }
 
   // ── Lifecycle: relogin after session death, graceful shutdown ─────────────
